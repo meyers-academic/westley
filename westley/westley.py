@@ -5,6 +5,16 @@ from tqdm import tqdm
 from copy import deepcopy
 
 class SingleBaselineInterpolatingModel(object):
+    """
+    Parameters:
+    -----------
+    cross_corr_data : numpy.ndarray
+        cross correlation data
+    cross_corr_uncertainty : numpy.ndarray
+        cross correlation data uncertainty
+    cross_corr_frequencies : numpy.ndarray
+        cross correlation frequencies
+    """
     def __init__(self, cross_corr_data, cross_corr_sigma, cross_corr_frequencies, min_knots=1, max_knots=40,
                  amin=1e-12, amax=1e-7, baseline='HL', model_type='cubic'):
         self.cross_corr_data = cross_corr_data
