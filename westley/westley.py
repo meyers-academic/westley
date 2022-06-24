@@ -3,6 +3,7 @@ from scipy.stats import norm
 from scipy.interpolate import interp1d, CubicSpline
 from tqdm import tqdm
 from copy import deepcopy
+import matplotlib.pyplot as plt
 
 class SingleBaselineInterpolatingModel(object):
     """
@@ -50,13 +51,13 @@ class SingleBaselineInterpolatingModel(object):
         elif model_type == 'pp':
             interpolator = interp1d(np.log10(knots[config]),
                                     np.log10(knot_amplitudes[config]), fill_value="extrapolate")
-            model = 10**interpolator(self.cross_corr_frequencies)
+            model = 10**interpolator(np.log10(self.cross_corr_frequencies))
 
         return model
 
 
 class MultiBaselineInterpolatingModel(object):
-    def __init__(self, single_baseline_list, starting_knot_amplitudes_dict,
+    def __init__(self, single_baseline_list,
                  common_signal_min_knots=1, common_signal_max_knots=40,
                  common_signal_amax=1e-7, common_signal_amin=1e-12,
                  common_model_type='cubic'):
@@ -75,15 +76,16 @@ class MultiBaselineInterpolatingModel(object):
             self.common_signal_delta_x = np.diff(self.common_signal_available_knots)[0]
         else:
             self.common_signal_delta_x = maxf - minf
-        self.common_signal_configuration = np.atleast_1d(np.ones(common_signal_max_knots, dtype=bool) )
+        # self.common_signal_configuration = np.atleast_1d(np.ones(common_signal_max_knots, dtype=bool) )
         self.common_model_type = common_model_type
 
         # dicts for individual baselines
-        self.individual_knot_amplitudes = starting_knot_amplitudes_dict
+        # self.individual_knot_amplitudes = starting_knot_amplitudes_dict
 
     def evaluate_common_model(self, baseline, common_knots, common_knot_amplitudes, config):
         # config = self.common_signal_configuration
         # one node turned on
+
         if np.sum(config) == 1:
             return np.ones(baseline.cross_corr_frequencies.size) * common_knot_amplitudes[config]
         # no nodes turned on
@@ -98,7 +100,7 @@ class MultiBaselineInterpolatingModel(object):
         elif self.common_model_type == 'pp':
             interpolator = interp1d(np.log10(common_knots[config]),
                                     np.log10(common_knot_amplitudes[config]), fill_value="extrapolate")
-            model = 10**interpolator(baseline.cross_corr_frequencies)
+            model = 10**interpolator(np.log10(baseline.cross_corr_frequencies))
 
         return model
 
@@ -224,7 +226,7 @@ class Sampler(object):
 
         # common signal death move
         if myval == 0:
-            if np.sum(self.mbim.common_signal_configuration) == self.mbim.common_signal_min_knots:
+            if np.sum(self.common_config) == self.mbim.common_signal_min_knots:
                 return (-np.inf, -np.inf,
                         self.individual_knots, self.individual_amplitudes, self.individual_config, self.common_knots, self.common_amplitudes, self.common_config)
 
@@ -276,7 +278,7 @@ class Sampler(object):
 
         # common signal death move
         if myval == 0:
-            if np.sum(self.mbim.common_signal_configuration) == self.mbim.common_signal_min_knots:
+            if np.sum(self.common_config) == self.mbim.common_signal_min_knots:
                 return (-np.inf, -np.inf,
                         self.individual_knots, self.individual_amplitudes, self.individual_config, self.common_knots, self.common_amplitudes, self.common_config)
             # choose index to add from list of knots that are turned off
@@ -445,6 +447,16 @@ class Sampler(object):
         return WestleyResults(acceptances, lls, move_types, individual_knots, individual_amps, individual_configs, common_knots, common_amps, common_config)
 
 
+def get_dicts_from_idx(ik, ia, ic, idx):
+    mydict_knots = {}
+    mydict_amps = {}
+    mydict_config = {}
+    for bl in ik.keys():
+        mydict_knots[bl] = ik[bl][idx]
+        mydict_amps[bl] = ia[bl][idx]
+        mydict_config[bl] = ic[bl][idx]
+    return mydict_knots, mydict_amps, mydict_config
+
 class WestleyResults(object):
     def __init__(self, acceptances, lls, move_types, individual_knots, individual_amps, individual_configs, common_knots, common_amps, common_config):
         self.acceptances = acceptances
@@ -458,3 +470,27 @@ class WestleyResults(object):
         self.common_config = common_config
 
         self.Nsamples = np.size(lls)
+
+    def plot_model_on_data(self, mbim, nsamples, alpha_weight=0.01):
+        print(len(mbim.baselines))
+        fig, axs = plt.subplots(1, len(mbim.baselines), figsize=(6*len(mbim.baselines), 4))
+        if len(mbim.baselines) == 1:
+            axs = [axs]
+        keys = list(mbim.baseline_dict.keys())
+        for ii in range(nsamples):
+            idx = np.random.choice(self.common_config.shape[0])
+            mylist = get_dicts_from_idx(self.individual_knots, self.individual_amps, self.individual_configs, idx)
+            im, cm = mbim.evaluate_model(mylist[0], mylist[1], mylist[2], self.common_knots[idx], self.common_amps[idx], self.common_config[idx])
+
+            for jj, blkey in enumerate(keys):
+                axs[jj].plot(mbim.baseline_dict[blkey].cross_corr_frequencies, np.array(im[blkey]) + np.array(cm[blkey]), alpha=alpha_weight)
+            # plt.plot(frequencies, im['HL'], label='individual')
+            # plt.plot(frequencies, cm['HL'], label='combined')
+
+        for jj, blkey in enumerate(keys):
+            axs[jj].errorbar(mbim.baseline_dict[blkey].cross_corr_frequencies, mbim.baseline_dict[blkey].cross_corr_data,
+                             yerr=mbim.baseline_dict[blkey].cross_corr_sigma, fmt='o', alpha=0.5, zorder=-1000)
+            # axs[ii].legend()
+            axs[jj].set_xlabel('Frequency [Hz]')
+            axs[jj].set_ylabel('$\Omega_{gw}(f)$')
+        return fig
