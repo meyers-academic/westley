@@ -5,7 +5,7 @@
 """This is a sample python file for testing functions from the source code."""
 from __future__ import annotations
 
-from minnow import fitter
+from westley import fitter
 from scipy.stats import kstest
 import numpy as np
 import matplotlib.pyplot as plt
