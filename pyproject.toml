@@ -3,11 +3,11 @@ requires = ["flit_core >=2,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name =  "py-project-toml"
+name =  "westley"
 authors = [
-    {name = "Daniel Ciborowski", email = "dciborow@microsoft.com"},
+    {name = "Patrick Meyers", email = "pmeyers279@gmail.com"},
 ]
-description = "Sample Python Project for creating a new Python Module"
+description = "A transdimensional sampler + applications to the SGWB"
 readme = "README.md"
 classifiers = [
     "Development Status :: 3 - Alpha",
