@@ -11,7 +11,7 @@ from loguru import logger
 class BaseSplineModel(object):
     def __init__(self, data, N_possible_knots, xrange,
                  height_prior_range, interp_type='linear', log_output=False,
-                 log_space_xvals=False, birth_uniform_frac=0.5,
+                 log_space_xvals=True, birth_uniform_frac=0.5,
                  min_knots=2, birth_gauss_scalefac=1):
         """
         Params:
@@ -87,12 +87,14 @@ class BaseSplineModel(object):
     def proposal_cycle(self):
         """proposal cycle"""
         return self._proposal_cycle
+    
     @proposal_cycle.setter
     def proposal_cycle(self, value):
         self._proposal_cycle = value
         self._available_proposals = list(self._proposal_cycle.keys())
 
-    def evaluate_interp_model(self, xvals_to_evaluate, heights, config, knots, log_xvals=False):
+    def evaluate_interp_model(self, xvals_to_evaluate, heights,
+                              config, knots, log_xvals=False):
         """
         based on the supplied configuration and heights of the knots
         evaluate the model at `xvals_to_evaluate`.
@@ -413,6 +415,39 @@ class SamplerResults(object):
     def get_num_knots(self):
         return np.sum(self.configurations, axis=1)
 
+    def return_knot_info(self, offset=0):
+        knot_configs = self.configurations  # [offset:, :]
+        num_knots = knot_configs.sum(axis=1)
+        return knot_configs, num_knots
+        
+    def return_knot_placements(self, offset=0):
+        all_weights = []
+        all_bins = []
+        for ii in range(self.knots.shape[1]):
+            if np.sum(self.configurations.astype(bool)[offset:, ii]) > 0:    
+                weights, bins, x = plt.hist(self.knots[self.configurations.astype(bool)[:, ii], ii])
+                all_weights.append(weights)
+                all_bins.append(bins[:-1])
+        #plt.show()
+        return all_bins, all_weights
+
+    def return_knot_heights(self, offset=0, toggle=False):
+        if toggle:
+            knot_heights = []
+            for ii in range(self.knots.shape[1]):
+                knot_heights.append(10**(self.heights[self.configurations.astype(bool)[:, ii], ii]))
+        else: 
+            knot_heights = 10**self.heights[offset:, :]
+        return knot_heights
+
+    def return_knot_frequencies(self, offset=0, toggle=False):
+        temp = []
+        for ii in range(self.knots.shape[1]):
+            if toggle:
+                temp.append(self.knots[self.configurations.astype(bool)[:, ii], ii])
+            else:
+                temp.append(self.knots[:, ii])
+        return temp
 
 class SmoothCurveDataObj(object):
     """

@@ -60,6 +60,6 @@ def test_create_initialize_popstock_plpp_md_runs():
 
     # Verify the correct models were used
     assert isinstance(pop_obj.models['mass'], 
-                     gwpopulation.models.mass.SinglePeakSmoothedMassDistribution)
+                      gwpopulation.models.mass.SinglePeakSmoothedMassDistribution)
     assert isinstance(pop_obj.models['redshift'], 
-                     gwpopulation.models.redshift.MadauDickinsonRedshift)
+                      gwpopulation.models.redshift.MadauDickinsonRedshift)

@@ -2,6 +2,7 @@
 
 from .fitter import BaseSplineModel
 import numpy as np
+from scipy.stats import norm
 
 
 class RedshiftSampler(BaseSplineModel):
@@ -59,6 +60,10 @@ class FitOmega(BaseSplineModel):
         # so we need to convert xvalues and knots to log space, do the interpolation in log space,
         # and then convert back to linear space
         omega_model = 10**self.evaluate_interp_model(
-            np.log10(self.data.data_xvals), log10_heights, config, np.log10(knots))
+            np.log10(self.data.data_xvals),
+            log10_heights,
+            config,
+            np.log10(knots))
 
-        return np.sum(norm.logpdf(omega_model - self.data.data_yvals, scale=self.data.data_errors))
+        return np.sum(norm.logpdf(omega_model - self.data.data_yvals,
+                                  scale=self.data.data_errors))
