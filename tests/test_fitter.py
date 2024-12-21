@@ -29,9 +29,9 @@ class TestFitter:
     fake_data = fitter.SmoothCurveDataObj(fake_xvals,
                                           fake_yvals,
                                           fake_yval_errors)
-
+    max_knots = 20
     bsm = fitter.FitSmoothCurveModel(fake_data,
-                                 5,
+                                 max_knots,
                                  (0, 5),
                                  (-2, 2),
                                  interp_type='linear',
@@ -44,53 +44,70 @@ class TestFitter:
 
 
     def test_prior_run_full_proposal(self):
-
-        results = self.bsm.sample(Niterations=50000,
-                                  prior_test=True)
+        results = self.bsm.sample(Niterations=200000, prior_test=True)
 
         # thin by factor of 100 because
         # of possible correlations between samples
         num_knots = results.get_num_knots()[::100]
-        p_value = check_uniform_distribution(num_knots, bins=10, discrete=True)
+        results.print_acceptance_rates_by_proposal()
+        p_value = check_uniform_distribution(num_knots, discrete=True)
+        print('p_value', p_value)
+        assert p_value > 0.05, f"Distribution of knot counts is not uniform (p={p_value:.3f})"
+
+        p_value = check_uniform_distribution(results.heights[::100, 0], range=(self.bsm.ylow, self.bsm.yhigh - self.bsm.ylow))
+        print('p_value', p_value)
+        plt.hist(results.heights[::100, 0])
+        plt.savefig("height_samples_full.png")
+        plt.close()
+        np.savetxt("height_samples.txt", results.heights[::100, 0])
+        print('log_ratios', results.log_ratios)
+        print('log_ratios inf fraction', np.sum(np.isinf(results.log_ratios)) / len(results.log_ratios))
         assert p_value > 0.05, f"Distribution of knot counts is not uniform (p={p_value:.3f})"
 
     def test_prior_run_amplitude_prior_proposal(self):
-
-        results = self.bsm.sample(Niterations=50000,
-                                  prior_test=True,
-                                  proposal_cycle={'change_amplitude_prior_draw': 1})
-
+        bsm = fitter.FitSmoothCurveModel(self.fake_data,
+                                    self.max_knots,
+                                    (0, 5),
+                                    (-2, 2),
+                                    interp_type='linear',
+                                    log_output=False,
+                                    log_space_xvals=False,
+                                    birth_uniform_frac=0.5,
+                                    min_knots=2,
+                                    birth_gauss_scalefac=1
+                                        )
+        results = bsm.sample(Niterations=200000, prior_test=True, proposal_cycle={'change_amplitude_prior_draw': 1})
         # thin by factor of 100 because
+
         # of possible correlations between samples
-        p_value = check_uniform_distribution(results.heights[::100, 0],
-                                             range=(self.bsm.ylow,
-                                                    self.bsm.yhigh - self.bsm.ylow))
+        p_value = check_uniform_distribution(results.heights[::100, 0], range=(self.bsm.ylow, self.bsm.yhigh - self.bsm.ylow))
         plt.hist(results.heights[::100, 0])
         plt.savefig("height_samples.png")
+        plt.close()
         np.savetxt("height_samples.txt", results.heights[::100, 0])
         assert p_value > 0.05, f"Distribution of knot counts is not uniform (p={p_value:.3f})"
 
     def test_model_initialization(self):
         """Test model initialization and properties"""
-        assert self.bsm.N_possible_knots == 5
+        assert self.bsm.N_possible_knots == self.max_knots
         assert self.bsm.min_knots == 2
         assert self.bsm.ylow == -2
         assert self.bsm.yhigh == 2
         assert self.bsm.yrange == 4
-        assert len(self.bsm.available_knots) == 5
+        assert len(self.bsm.available_knots) == self.max_knots
 
     def test_evaluate_interp_model_single_knot(self):
         """Test interpolation with single knot"""
-        test_config = np.zeros(5, dtype=bool)
+        test_config = np.zeros(self.max_knots, dtype=bool)
         test_config[0] = True
-        test_heights = np.ones(5)
+        test_heights = np.ones(self.max_knots)
         result = self.bsm.evaluate_interp_model(np.array([2.5]), test_heights, test_config, self.bsm.available_knots)
         assert np.allclose(result, 1.0)
 
     def test_evaluate_interp_model_multiple_knots(self):
         """Test interpolation with multiple knots"""
-        test_config = np.ones(5, dtype=bool)
-        test_heights = np.ones(5)
+        test_config = np.ones(self.max_knots, dtype=bool)
+        test_heights = np.ones(self.max_knots)
         x_test = np.linspace(0, 5, 10)
         result = self.bsm.evaluate_interp_model(x_test, test_heights, test_config, self.bsm.available_knots)
         assert len(result) == len(x_test)
@@ -98,69 +115,69 @@ class TestFitter:
 
     def test_birth_proposal_mechanics(self):
         """Test birth proposal basics"""
-        self.bsm.configuration = np.zeros(5, dtype=bool)
-        self.bsm.configuration[0:2] = True  # Start with minimum knots
+        self.bsm.state = self.bsm.state.with_updates(configuration=np.zeros(self.max_knots, dtype=bool))
+        self.bsm.state.configuration[0:2] = True  # Start with minimum knots
         
-        ll, logR, config, heights, knots = self.bsm.birth()
+        proposal = self.bsm.birth()
         
-        if ll != -np.inf:  # If proposal was valid
-            assert np.sum(config) == 3  # Should have one more knot
-            assert heights.shape == (5,)
-            assert knots.shape == (5,)
+        if proposal is not None:  # If proposal was valid
+            assert np.sum(proposal.new_config) == 3  # Should have one more knot
+            assert proposal.new_heights.shape == (self.max_knots,)
+            assert proposal.new_knots.shape == (self.max_knots,)
 
     def test_death_proposal_mechanics(self):
         """Test death proposal basics"""
-        self.bsm.configuration = np.ones(5, dtype=bool)
+        self.bsm.state = self.bsm.state.with_updates(configuration=np.ones(self.max_knots, dtype=bool))
         
-        ll, logR, config, heights, knots = self.bsm.death()
+        proposal = self.bsm.death()
         
-        if ll != -np.inf:  # If proposal was valid
-            assert np.sum(config) == 4  # Should have one less knot
-            assert heights.shape == (5,)
-            assert knots.shape == (5,)
+        if proposal is not None:  # If proposal was valid
+            assert np.sum(proposal.new_config) == self.max_knots - 1  # Should have one less knot
+            assert proposal.new_heights.shape == (self.max_knots,)
+            assert proposal.new_knots.shape == (self.max_knots,)
 
     def test_change_amplitude_gaussian_mechanics(self):
         """Test Gaussian amplitude change proposal"""
-        original_heights = self.bsm.current_heights.copy()
+        original_heights = self.bsm.state.heights.copy()
         
-        ll, logR, config, heights, knots = self.bsm.change_amplitude_gaussian()
+        proposal = self.bsm.change_amplitude_gaussian()
         
-        if ll != -np.inf:
+        if proposal is not None:
             # Only one height should change
-            diff = heights != original_heights
-            assert np.sum(diff) == 1
+            diff = proposal.new_heights != original_heights
+            assert np.sum(diff) == 1, "Only one height should change"
             # Changed height should be within bounds
-            assert np.all(heights >= self.bsm.ylow)
-            assert np.all(heights <= self.bsm.yhigh)
+            assert np.all(proposal.new_heights >= self.bsm.ylow)
+            assert np.all(proposal.new_heights <= self.bsm.yhigh)
 
     def test_change_amplitude_prior_draw_mechanics(self):
         """Test prior draw amplitude change proposal"""
-        original_heights = self.bsm.current_heights.copy()
+        original_heights = self.bsm.state.heights.copy()
         
-        ll, logR, config, heights, knots = self.bsm.change_amplitude_prior_draw()
+        proposal = self.bsm.change_amplitude_prior_draw()
         
-        if ll != -np.inf:
+        if proposal is not None:
             # Only one height should change
-            diff = heights != original_heights
+            diff = proposal.new_heights != original_heights
             assert np.sum(diff) == 1
             # New height should be within prior bounds
-            assert np.all(heights >= self.bsm.ylow)
-            assert np.all(heights <= self.bsm.yhigh)
+            assert np.all(proposal.new_heights >= self.bsm.ylow)
+            assert np.all(proposal.new_heights <= self.bsm.yhigh)
 
     def test_change_knot_location_mechanics(self):
         """Test knot location change proposal"""
-        original_knots = self.bsm.available_knots.copy()
+        original_knots = self.bsm.state.knots.copy()
         
-        ll, logR, config, heights, knots = self.bsm.change_knot_location()
+        proposal = self.bsm.change_knot_location()
         
-        if ll != -np.inf:
+        if proposal is not None:
             # Only one knot should change
-            diff = knots != original_knots
+            diff = proposal.new_knots != original_knots
             assert np.sum(diff) == 1
             # New knot should be within bounds
             idx_changed = np.where(diff)[0][0]
-            assert knots[idx_changed] >= self.bsm.xlows[idx_changed]
-            assert knots[idx_changed] <= self.bsm.xhighs[idx_changed]
+            assert proposal.new_knots[idx_changed] >= self.bsm.xlows[idx_changed]
+            assert proposal.new_knots[idx_changed] <= self.bsm.xhighs[idx_changed]
 
     def test_height_prior_bounds(self):
         """Test height prior boundary conditions"""
@@ -174,18 +191,38 @@ class TestFitter:
 
     def test_amplitude_prior_draw_proposal(self):
         """Test that amplitude prior draw actually changes values"""
-        initial_height = self.bsm.current_heights[0]
+        initial_height = self.bsm.state.heights[0]
         
         # Perform several proposals
         different_values = set()
         for _ in range(100):
-            new_ll, ratio, new_config, new_heights, new_knots = self.bsm.change_amplitude_prior_draw()
-            different_values.add(new_heights[0])
+            proposal = self.bsm.change_amplitude_prior_draw()
+            different_values.add(proposal.new_heights[0])
         
         # Should get multiple different values
         assert len(different_values) > 1, "Amplitude proposals not generating different values"
 
-def check_uniform_distribution(arr, bins=10, discrete=False, range=None):
+    def test_birth_and_death_only(self):
+        num_samples = 200_000
+        self.bsm.birth_uniform_frac = np.random.rand()
+        birthweight = np.random.rand()
+        
+        print('birthweight', birthweight)
+        print('fraction of birth proposals from uniform dist', self.bsm.birth_uniform_frac)
+
+        # set proposal cycle
+        proposal_cycle = {'birth': birthweight, 'death': 1 - birthweight}
+
+        results = self.bsm.sample(Niterations=num_samples, proposal_cycle=proposal_cycle, prior_test=True)
+        num_knots = results.get_num_knots()[::50]
+        bins, counts = np.unique(num_knots, return_counts=True)
+        results.print_acceptance_rates_by_proposal()
+        p_value = check_uniform_distribution(num_knots, discrete=True)
+        print('p_value', p_value)
+        assert p_value > 0.05, f"Distribution of knot counts is not uniform (p={p_value:.3f})"
+        assert len(results.log_likelihoods) == num_samples, "Did not sample the correct number of iterations"
+
+def check_uniform_distribution(arr, discrete=False, range=None):
     # for the discrete case, we need to use the unique values
     if discrete:
         bins, counts = np.unique(arr, return_counts=True)
@@ -194,6 +231,7 @@ def check_uniform_distribution(arr, bins=10, discrete=False, range=None):
         expected_count_error = np.sqrt(expected_counts)
         # Gaussian uncertainty (as long as counts are large)
         pval_per_bin = 1 - norm.cdf(counts, loc=expected_counts, scale=expected_count_error)
+        print(pval_per_bin)
         # check that p-values are uniform across bins
         ks_stat, p_value = kstest(pval_per_bin, 'uniform')
     # for the continuous case, we need to use the histogram

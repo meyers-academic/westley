@@ -8,47 +8,93 @@ from loguru import logger
 
 
 
-class BaseSplineModel(object):
-    def __init__(self, data, N_possible_knots, xrange,
-                 height_prior_range, interp_type='linear', log_output=False,
-                 log_space_xvals=True, birth_uniform_frac=0.5,
-                 min_knots=2, birth_gauss_scalefac=1):
-        """
-        Params:
-        ------
-        data : `object`
-            Abstract data object that gets passed to the likelihood
-            and used in calculating the likelihood
-        N_possible_knots : `int`
-            number of possible knots
-        xrange : `tuple`
-            low and high values on the x-axis  (low, high)
-            between which we place the N knots.
-        height_prior_range : `tuple`
-            low and high values for the uniform prior on the heights
-            of the knots
-        interp_type : `str`
-            interpolation type. "linear," "cubic" and "akima" are
-            the valid options.
-        """
-        self.birth_uniform_frac = birth_uniform_frac
-        self.birth_gauss_scalefac = birth_gauss_scalefac
+from typing import NamedTuple, Optional, Dict, Any, List
+from dataclasses import dataclass
+import numpy as np
+from scipy.stats import norm
+from copy import deepcopy
+from scipy.interpolate import interp1d, Akima1DInterpolator
+
+class ProposalResult(NamedTuple):
+    log_likelihood: float
+    log_ratio: float
+    new_config: np.ndarray
+    new_heights: np.ndarray
+    new_knots: np.ndarray
+
+@dataclass(frozen=True)
+class SplineState:
+    configuration: np.ndarray
+    heights: np.ndarray
+    knots: np.ndarray
+    log_likelihood: Optional[float] = None
+
+    def with_updates(self, **kwargs):
+        return SplineState(**{**self.__dict__, **kwargs})
+
+class ProposalManager:
+    def __init__(self):
+        self._proposals = {}
+        self._weights = {}
+    
+    def register_proposal(self, name, func, weight=1):
+        self._proposals[name] = func
+        self._weights[name] = weight
+    
+    def get_next_proposal(self):
+        proposals = list(self._proposals.keys())
+        weights = list(self._weights.values())
+        return np.random.choice(proposals, p=np.array(weights)/sum(weights))
+    
+    @property
+    def proposals(self):
+        return self._proposals
+    
+    @proposals.setter
+    def proposals(self, new_proposals):
+        old_proposals = dict(self._proposals)
+        self._proposals = {}
+        self._weights = {}
+        for name, weight in new_proposals.items():
+            if name in old_proposals:
+                self._proposals[name] = old_proposals[name]
+                self._weights[name] = weight
+            else:
+                raise ValueError(f"Proposal {name} is not registered.")
+        
+    @property
+    def weights(self):
+        return self._weights
+
+def proposal(name, weight=1):
+    def decorator(func):
+        def wrapper(self, *args, **kwargs):
+            return func(self, *args, **kwargs)
+        wrapper._proposal_name = name
+        wrapper._proposal_weight = weight
+        return wrapper
+    return decorator
+
+class BaseSplineModel:
+    def __init__(self, data, N_possible_knots, xrange, height_prior_range, 
+                 min_knots=2, birth_uniform_frac=0.5, birth_gauss_scalefac=0.5,
+                 log_output=False, log_space_xvals=False, interp_type="linear"):
+        
         self.data = data
         self.N_possible_knots = N_possible_knots
         self.min_knots = min_knots
         self.xlow = xrange[0] + 1e-3
         self.xhigh = xrange[1]
-
-
         self.yhigh = height_prior_range[1]
         self.ylow = height_prior_range[0]
-
         self.yrange = self.yhigh - self.ylow
-
+        self.birth_uniform_frac = birth_uniform_frac
+        self.birth_gauss_scalefac = birth_gauss_scalefac
         self.interp_type = interp_type
+
         if log_space_xvals:
-            # raise NotImplementedError('log_space_xvals not implemented at the moment')
-            base = np.logspace(np.log10(self.xlow), np.log10(self.xhigh), num=self.N_possible_knots + 1)
+            base = np.logspace(np.log10(self.xlow), np.log10(self.xhigh), 
+                             num=self.N_possible_knots + 1)
             self.xlows = base[:-1]
             self.xhighs = base[1:]
             self.available_knots = (self.xlows + self.xhighs) / 2
@@ -56,361 +102,353 @@ class BaseSplineModel(object):
             self.deltax = (self.xhigh - self.xlow) / N_possible_knots
             self.xlows = np.arange(N_possible_knots) * self.deltax + self.xlow
             self.xhighs = self.xlows + self.deltax
-            self.available_knots = np.linspace(self.xlow + self.deltax / 2, self.xhigh - self.deltax / 2, num=self.N_possible_knots)
+            self.available_knots = np.linspace(self.xlow + self.deltax / 2, 
+                                             self.xhigh - self.deltax / 2, 
+                                             num=self.N_possible_knots)
 
-        # keeps track of configuration, i.e. what points are turned on
-        # or turned off.
-        self.configuration = np.ones(self.N_possible_knots, dtype=bool)
-        # self.configuration = np.random.randint(0, 2, size=self.N_possible_knots).astype(bool)
-        self.current_heights = np.ones(self.N_possible_knots) * (self.yhigh - self.ylow) / 2. + self.ylow
+        self.state = SplineState(
+            configuration=np.ones(self.N_possible_knots, dtype=bool),
+            heights=np.ones(self.N_possible_knots) * (self.yhigh - self.ylow) / 2. + self.ylow,
+            knots=self.available_knots.copy()
+        )
+        
+        self.proposal_manager = ProposalManager()
         self.log_output = log_output
 
-        # for handling proposals
-        self._proposal_cycle = {
-            'birth': 1,
-            'death': 1,
-            'change_amplitude_prior_draw': 1,
-            'change_amplitude_gaussian': 1,
-            'change_knot_location': 1
-        }
-        self._available_proposals = list(self._proposal_cycle.keys())
+        # Register proposals
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if callable(attr) and hasattr(attr, '_proposal_name'):
+                self.proposal_manager.register_proposal(attr._proposal_name, attr, attr._proposal_weight)
 
-    @property
-    def available_proposals(self):
-        """The available_proposals property."""
-        return self._available_proposals
-    @available_proposals.setter
-    def available_proposals(self, value):
-        self._available_proposals = value
+        # Backward compatibility
+        self.configuration = self.state.configuration
+        self.current_heights = self.state.heights
+        self._proposal_cycle = self.proposal_manager.weights
+        self._available_proposals = list(self.proposal_manager.proposals.keys())
 
-    @property
-    def proposal_cycle(self):
-        """proposal cycle"""
-        return self._proposal_cycle
-    
-    @proposal_cycle.setter
-    def proposal_cycle(self, value):
-        self._proposal_cycle = value
-        self._available_proposals = list(self._proposal_cycle.keys())
-
-    def evaluate_interp_model(self, xvals_to_evaluate, heights,
-                              config, knots, log_xvals=False):
-        """
-        based on the supplied configuration and heights of the knots
-        evaluate the model at `xvals_to_evaluate`.
-        """
-        if log_xvals:
-            knots = np.log10(knots)
-        if np.sum(config) == 0:
-            if self.log_output:
-                return -np.inf * np.ones(xvals_to_evaluate.size)
-            else:
-                return np.zeros(xvals_to_evaluate.size)
-        elif np.sum(config) == 1:
-            return heights[config].squeeze() * np.ones(xvals_to_evaluate.size)
-        elif self.interp_type == 'linear':
-            myfunc = interp1d(knots[config], heights[config],
-                              fill_value='extrapolate')
-        elif self.interp_type == 'cubic':
-            myfunc = CubicSpline(knots[config], heights[config],
-                                 extrapolate=True)
-        elif self.interp_type == 'akima':
-            myfunc = Akima1DInterpolator(knots[config], heights[config])
-            return myfunc(xvals_to_evaluate, extrapolate=True)
+    def evaluate_interp_model(self, x, heights, configuration, knots):
+        active_knots = knots[configuration]
+        active_heights = heights[configuration]
+        
+        if len(active_knots) < 2:
+            return active_heights[0]
+            
+        sorted_indices = np.argsort(active_knots)
+        x_sorted = active_knots[sorted_indices]
+        y_sorted = active_heights[sorted_indices]
+        
+        if self.interp_type == "linear":
+            interpolator = interp1d(x_sorted, y_sorted, bounds_error=False, 
+                                  fill_value=(y_sorted[0], y_sorted[-1]))
+        elif self.interp_type == "akima":
+            interpolator = Akima1DInterpolator(x_sorted, y_sorted)
         else:
-            raise ValueError('available spline types are "linear," "cubic" and "akima"')
-        return myfunc(xvals_to_evaluate)
+            raise ValueError(f"Unknown interpolation type: {self.interp_type}")
+            
+        return interpolator(x)
 
-    @abstractmethod
-    def ln_likelihood(self, config, heights, knot_locations):
-        """
-        You will need to implement this yourself. It will take the model, and put it into whatever space
-        it needs to be in to calculate your likelihood, and then calculate the likelihood.
-        """
-        pass
-
+    @proposal(name='birth', weight=1)
     def birth(self):
-        if np.sum(self.configuration) == self.N_possible_knots:
-            return (-np.inf, -np.inf, self.configuration, self.current_heights, self.available_knots)
+        inactive_idx = np.where(~self.state.configuration)[0]
+        if len(inactive_idx) == 0:
+            return None
+            
+        idx_to_add = np.random.choice(inactive_idx)
+        new_config = self.state.configuration.copy()
+        new_config[idx_to_add] = True
+        
+        new_knots = self.state.knots.copy()
+        new_heights = self.state.heights.copy()
+        
+        new_knots[idx_to_add] = (np.random.rand() * 
+            (self.xhighs[idx_to_add] - self.xlows[idx_to_add]) + 
+            self.xlows[idx_to_add])
+        
+        height_from_model = self.evaluate_interp_model(
+            new_knots[idx_to_add],
+            self.state.heights,
+            self.state.configuration,
+            self.state.knots
+        )
+        
+        if np.random.rand() < self.birth_uniform_frac:
+            new_heights[idx_to_add] = (np.random.rand() * 
+                (self.yhigh - self.ylow) + self.ylow)
         else:
-            idx_to_add = np.random.choice(np.where(~self.configuration)[0])
-            new_heights = deepcopy(self.current_heights)
-            new_config = deepcopy(self.configuration)
-            new_config[idx_to_add] = True
-
-        randnum = np.random.rand()
-
-        # random choice of knot location within bounds
-        new_knots = self.available_knots
-        new_knots[idx_to_add] = np.random.rand() * (self.xhighs[idx_to_add] - self.xlows[idx_to_add]) + self.xlows[idx_to_add]
-
-        # proposal height
-        height_from_model = self.evaluate_interp_model(new_knots[idx_to_add],
-                                                       self.current_heights, self.configuration, self.available_knots)
-        if randnum < self.birth_uniform_frac:
-            # uniform draw
-            new_heights[idx_to_add] = np.random.rand() * (self.yhigh - self.ylow) + self.ylow
-        else:
-            # gaussian draw around height
-            new_heights[idx_to_add] = norm.rvs(loc=height_from_model, scale=self.birth_gauss_scalefac, size=1)
-
-
-        log_qx = 0
-
-        log_qy = np.log(self.birth_uniform_frac / self.yrange + \
-                        (1 - self.birth_uniform_frac) * norm.pdf(new_heights[idx_to_add], loc=height_from_model,
-                                                                    scale=self.birth_gauss_scalefac))
-
-        log_px = 0
-
-        # log_py = self.get_height_log_prior(new_heights[idx_to_add])
-        log_py = self.get_height_log_prior(new_heights[idx_to_add]) # + self.get_width_log_prior(new_knots[idx_to_add], idx_to_add)
-
+            new_heights[idx_to_add] = norm.rvs(
+                loc=height_from_model,
+                scale=self.birth_gauss_scalefac
+            )
+        
+        log_ratio = self._calculate_birth_ratio(idx_to_add, new_heights, new_knots)
         new_ll = self.ln_likelihood(new_config, new_heights, new_knots)
+        
+        return ProposalResult(new_ll, log_ratio, new_config, new_heights, new_knots)
 
-        return new_ll, (log_py - log_px) + (log_qx - log_qy), new_config, new_heights, new_knots
+    @proposal(name='death', weight=1)
+    def death(self):
+        active_idx = np.where(self.state.configuration)[0]
+        if len(active_idx) <= self.min_knots:
+            return None
+            
+        idx_to_remove = np.random.choice(active_idx)
+        new_config = self.state.configuration.copy()
+        new_config[idx_to_remove] = False
+        
+        log_ratio = self._calculate_death_ratio(
+            idx_to_remove, 
+            self.state.heights,
+            self.state.knots
+        )
+        
+        new_ll = self.ln_likelihood(new_config, self.state.heights, self.state.knots)
+        return ProposalResult(
+            new_ll, log_ratio, new_config, 
+            self.state.heights.copy(), self.state.knots.copy()
+        )
 
-    def death(self, specific_idx=None):
-        """
-        propose to "turn off" one of the current knots that are turned on.
-        """
-        if np.sum(self.configuration) == self.min_knots:
-            return (-np.inf, -np.inf, self.configuration, self.current_heights, self.available_knots)
-        else:
-            # pick one to turn off
-            idx_to_remove = np.random.choice(np.where(self.configuration)[0])
-            new_heights = deepcopy(self.current_heights)
-            new_config = deepcopy(self.configuration)
+    @proposal(name='change_amplitude_prior_draw', weight=1)
+    def change_amplitude_prior_draw(self):
+        active_idx = np.where(self.state.configuration)[0]
+        idx_to_change = np.random.choice(active_idx)
+        
+        new_heights = self.state.heights.copy()
+        new_heights[idx_to_change] = (np.random.rand() * 
+            (self.yhigh - self.ylow) + self.ylow)
+        
+        log_py_before = self.get_height_log_prior(self.state.heights[idx_to_change])
+        log_py_after = self.get_height_log_prior(new_heights[idx_to_change])
+        log_ratio = log_py_after - log_py_before
+        
+        new_ll = self.ln_likelihood(
+            self.state.configuration, new_heights, self.state.knots)
+        
+        return ProposalResult(
+            new_ll, log_ratio, self.state.configuration.copy(),
+            new_heights, self.state.knots.copy()
+        )
 
-            # turn it off
-            if specific_idx is None:
-                new_config[idx_to_remove] = False
-            else:
-                idx_to_remove = specific_idx
-                new_config[idx_to_remove] = False
-
-
-            # Find mean of the Gaussian we would have proposed from
-            height_from_model = self.evaluate_interp_model(self.available_knots[idx_to_remove],
-                                                           self.current_heights, new_config, self.available_knots)
-
-            log_qx = np.log(self.birth_uniform_frac / self.yrange + \
-                              (1 - self.birth_uniform_frac) * norm.pdf(self.current_heights[idx_to_remove],
-                                                                          loc=height_from_model,
-                                                                          scale=self.birth_gauss_scalefac))
-            log_qy = 0
-
-            log_px = self.get_height_log_prior(self.current_heights[idx_to_remove]) # + self.get_width_log_prior(self.available_knots[idx_to_remove], idx_to_remove)
-
-            log_py = 0
-
-            new_ll = self.ln_likelihood(new_config, self.current_heights, self.available_knots)
-
-            return new_ll, (log_py - log_px) + (log_qx - log_qy), new_config, new_heights, self.available_knots
-
+    @proposal(name='change_amplitude_gaussian', weight=1)
     def change_amplitude_gaussian(self):
-        """
-        Pick one of the knots that are turned
-        on and propose to change
-        its height by some small amount.
-        """
-        # random point to turn on
-        if np.sum(self.configuration) == 0:
-            return -np.inf, -np.inf, self.configuration, self.current_heights, self.available_knots
-        idx_to_change = np.random.choice(np.where(self.configuration)[0])
+        active_idx = np.where(self.state.configuration)[0]
+        idx_to_change = np.random.choice(active_idx)
+        
+        new_heights = self.state.heights.copy()
+        new_heights[idx_to_change] += norm.rvs(scale=self.birth_gauss_scalefac)
+        
+        log_py_before = self.get_height_log_prior(self.state.heights[idx_to_change])
+        log_py_after = self.get_height_log_prior(new_heights[idx_to_change])
+        log_ratio = log_py_after - log_py_before
+        
+        new_ll = self.ln_likelihood(
+            self.state.configuration, new_heights, self.state.knots)
+        
+        return ProposalResult(
+            new_ll, log_ratio, self.state.configuration.copy(),
+            new_heights, self.state.knots.copy()
+        )
 
-        # draw a "scale" factor between 1/10 and 1/3 of prior range
-        scalefac = (self.yhigh - self.ylow) * (np.random.rand() * (1/10 - 1/100) + 1/100)
+    @proposal(name='change_knot_location', weight=1)
+    def change_knot_location(self):
+        active_idx = np.where(self.state.configuration)[0]
+        idx_to_change = np.random.choice(active_idx)
+        
+        new_knots = self.state.knots.copy()
+        new_knots[idx_to_change] = (np.random.rand() * 
+            (self.xhighs[idx_to_change] - self.xlows[idx_to_change]) + 
+            self.xlows[idx_to_change])
+        
+        new_ll = self.ln_likelihood(
+            self.state.configuration, self.state.heights, new_knots)
+        
+        return ProposalResult(
+            new_ll, 0.0, self.state.configuration.copy(),
+            self.state.heights.copy(), new_knots
+        )
 
-        # propose to jump an amount given by zero-mean Gaussian with standard
-        # deviation given by scalefac above
-        new_heights = deepcopy(self.current_heights)
-        new_heights[idx_to_change] = self.current_heights[idx_to_change] + np.random.randn() * scalefac
+    def _calculate_birth_ratio(self, idx_to_add, new_heights, new_knots):
+        height_from_model = self.evaluate_interp_model(
+            new_knots[idx_to_add],
+            self.state.heights,
+            self.state.configuration,
+            self.state.knots
+        )
+        
+        log_qx = 0
+        log_qy = np.log(
+            self.birth_uniform_frac / self.yrange + 
+            (1 - self.birth_uniform_frac) * norm.pdf(
+                new_heights[idx_to_add],
+                loc=height_from_model,
+                scale=self.birth_gauss_scalefac
+            )
+        )
+        
+        log_px = 0
+        log_py = self.get_height_log_prior(new_heights[idx_to_add])
+        
+        proposal_weights = self.proposal_manager.weights
+        weight_birth = proposal_weights.get('birth', 1.0)
+        weight_death = proposal_weights.get('death', 1.0)
+        log_ratio = (log_py - log_px) + (log_qx - log_qy) + np.log(weight_death / weight_birth)
+        return log_ratio
 
-        new_ll = self.ln_likelihood(self.configuration, new_heights, self.available_knots)
-        prior_change = self.get_height_log_prior(new_heights[idx_to_change])
-        if prior_change != -np.inf:
-            prior_change = 0
+    def _calculate_death_ratio(self, idx_to_remove, heights, knots):
+        new_config = self.state.configuration.copy()
+        new_config[idx_to_remove] = False
+        height_from_model = self.evaluate_interp_model(
+            knots[idx_to_remove],
+            heights,
+            new_config,
+            knots
+        )
 
-        return new_ll, prior_change, self.configuration, new_heights, self.available_knots
+        log_qy = 0
+        log_qx = np.log(
+            self.birth_uniform_frac / self.yrange + 
+            (1 - self.birth_uniform_frac) * norm.pdf(
+                heights[idx_to_remove],
+                loc=height_from_model,
+                scale=self.birth_gauss_scalefac
+            )
+        )
 
+        log_py = 0
+        log_px = self.get_height_log_prior(heights[idx_to_remove])
+
+        proposal_weights = self.proposal_manager.weights
+        weight_birth = proposal_weights.get('birth', 1.0)
+        weight_death = proposal_weights.get('death', 1.0)
+        log_ratio = (log_py - log_px) + (log_qx - log_qy) + np.log(weight_birth / weight_death)
+        return log_ratio
 
     def get_height_log_prior(self, height):
-        if self.ylow <= height <= self.yhigh:
-            return -np.log(self.yrange)
-        return -np.inf
+        if height < self.ylow or height > self.yhigh:
+            return -np.inf
+        return -np.log(self.yrange)
 
-    def get_width_log_prior(self, val, idx):
-        if self.xlows[idx] <= val <= self.xhighs[idx]:
-            return -np.log(self.xhighs[idx] - self.xlows[idx])
-        return -np.inf
+    def ln_likelihood(self, configuration, heights, knots):
+        raise NotImplementedError("Subclasses must implement ln_likelihood")
 
-    def change_amplitude_prior_draw(self):
+    def sample(self, Niterations, prior_test=False, proposal_cycle=None,
+            start_heights=None, start_knots=None):
         """
-        choose one of the knots that are turned on and propose
-        a new height that is drawn from the prior.
+        Run MCMC sampling with optional starting state
         """
-
-        if np.sum(self.configuration) == 0:
-            return -np.inf, -np.inf, self.configuration, self.current_heights, self.available_knots
-        # random point to change amplitude
-        idx_to_change = np.random.choice(np.where(self.configuration)[0])
-        # propose draw from prior
-        new_heights = deepcopy(self.current_heights)
-        new_heights[idx_to_change] = (self.yhigh - self.ylow) * np.random.rand() + self.ylow
-
-        new_ll = self.ln_likelihood(self.configuration, new_heights, self.available_knots)
-
-        prior_change = self.get_height_log_prior(new_heights[idx_to_change])
-        if prior_change != -np.inf:
-            prior_change = 0
-        return new_ll, prior_change, self.configuration, new_heights, self.available_knots
-
-    def change_knot_location(self):
-        """change the location of one of the knots that are turned on
-        """
-        if np.sum(self.configuration) == 0:
-            return -np.inf, -np.inf, self.configuration, self.current_heights, self.available_knots
-        # find a knot that is turned on and change its location
-        idx_to_change = np.random.choice(np.where(self.configuration)[0])
-        new_knots = deepcopy(self.available_knots)
-        new_knots[idx_to_change] = np.random.rand() * (self.xhighs[idx_to_change] - self.xlows[idx_to_change]) + self.xlows[idx_to_change]
-        # new_ll = self.ln_likelihood(self.configuration, self.current_heights, new_knots)
-        new_ll = self.ln_likelihood(self.configuration, self.current_heights, new_knots)
-        prior_change = self.get_width_log_prior(new_knots[idx_to_change], idx_to_change)
-        if prior_change != -np.inf:
-            prior_change = 0
-        return new_ll, prior_change, self.configuration, self.current_heights, new_knots
-
-
-
-
-    def sample(self, Niterations, proposal_cycle=None, prior_test=False,
-               start_config=None, start_heights=None, temperature=1, start_knots=None):
-        """
-        Run RJMCMC sampler
-
-        Parameters:
-        -----------
-        Niterations : `int`
-            Number of MCMC samples
-        proposal_weights : `list` or `np.ndarray`, optional
-            list of weights for proposals. In order they are currently:
-                [birth, death, prior draw, gaussian]
-        prior_test : `bool`, optional, default=False
-            If True, it sets likelihood to 0 always and
-            samples only from the prior. Vital to check that
-            when adding new proposals you still get back the prior.
-        start_config : `np.ndarray`, optional, default=None
-            Array of boolean values that turn on or off certain knots.
-        start_heights: `np.ndarray`, optional, default=None
-            Array of starting heights for the knots.
-
-        Returns:
-        --------
-        results : `SamplerResults`
-            sampler results object that contains configurations,
-            heights, acceptances, likelihoods, and proposal types
-            for each MCMC step.
-
-            configurations = (Nsamples x Nspline points), for example.
-        """
-
-        if start_config is not None:
-            if np.size(start_config) == self.N_possible_knots:
-                self.configuration = start_config
-            else:
-                print('Start config you entered is not compatible...starting with all knots on')
-        if start_heights is not None:
-            if np.size(start_heights) == self.N_possible_knots:
-                self.current_heights = start_heights
-            else:
-                print('Start heights you entered is not compatible...starting with heights at zero')
-        if start_knots is not None:
-            if np.size(start_knots) == self.N_possible_knots:
-                self.available_knots = start_knots
-            else:
-                print('Start heights you entered is not compatible...starting with heights at zero')
-        configurations = np.zeros((Niterations, self.N_possible_knots))
+        if proposal_cycle is not None:
+            self.proposal_manager.proposals = proposal_cycle
+            
+        # Set initial state
+        if all(x is not None for x in [start_heights, start_knots]):
+            self.state = SplineState(
+                configuration=self.state.configuration,
+                heights=start_heights,
+                knots=start_knots
+            )
+        elif any(x is not None for x in [start_heights, start_knots]):
+            raise ValueError("If you provide a starting state, you must provide all components.")
+    
+    # Continue with existing MCMC logic
+    # ...existing code...
+        logger.info(f"Proposal cycle: {self.proposal_manager.proposals}")            
+        # Initialize arrays to store chain
+        configurations = np.zeros((Niterations, self.N_possible_knots), dtype=bool)
         heights = np.zeros((Niterations, self.N_possible_knots))
         knots = np.zeros((Niterations, self.N_possible_knots))
-
+        log_likelihoods = np.zeros(Niterations)
+        proposals_used = []
         acceptances = np.zeros(Niterations, dtype=bool)
-        move_types = np.zeros(Niterations, dtype=int)
+        log_ratios = np.zeros(Niterations)
+        
+        # Store initial state
+        configurations[0] = self.state.configuration
+        heights[0] = self.state.heights
+        knots[0] = self.state.knots
+        log_likelihoods[0] = self.ln_likelihood(
+            self.state.configuration,
+            self.state.heights,
+            self.state.knots
+        ) if not prior_test else 0
+        
+        n_accepted = 0
+        
+        with tqdm(total=Niterations, desc="Sampling", unit="iter") as pbar:
+            for i in range(1, Niterations):
+                # Get proposal type
+                proposal_type = self.proposal_manager.get_next_proposal()
+                proposals_used.append(proposal_type)
+                
+                # Get proposal
+                proposal = self.proposal_manager.proposals[proposal_type]()
+                    
+                if proposal is None:
+                    # No valid proposal, copy previous state
+                    configurations[i] = configurations[i-1]
+                    heights[i] = heights[i-1]
+                    knots[i] = knots[i-1]
+                    log_likelihoods[i] = log_likelihoods[i-1]
+                    continue
+                    
+                # Calculate acceptance probability
+                if prior_test:
+                    log_alpha = proposal.log_ratio
+                else:
+                    log_alpha = proposal.log_likelihood - log_likelihoods[i-1] + proposal.log_ratio
+                    
+                log_ratios[i] = proposal.log_ratio
 
-        lls = np.zeros(Niterations, dtype=float)
-
-        current_ll = self.ln_likelihood(self.configuration, self.current_heights, self.available_knots)
-        print(f'starting ll: {current_ll}')
-        if np.isnan(current_ll):
-            current_ll = -np.inf
-
-        # list of functions for proposals
-        if proposal_cycle is not None:
-            self.proposal_cycle = proposal_cycle
-        proposals = [getattr(self, p) for p in self.available_proposals]
-        proposal_weights = [self.proposal_cycle[p] for p in self.available_proposals]
-        logger.info(f"Proposal Cycle: {self.proposal_cycle}")
-        if 'birth' in self.available_proposals and 'death' in self.available_proposals:
-            birth_to_death_ratio = self.proposal_cycle['birth'] / self.proposal_cycle['death']
-
-        for ii in tqdm(range(Niterations)):
-            # choose proposal
-            myval = np.random.rand()
-            # choose proposal function with weights that were specified
-            proposal_idx = np.random.choice(np.arange(len(proposals)), p=np.array(proposal_weights) / np.sum(proposal_weights))
-
-            # get proposed points
-            tmp = proposals[proposal_idx]()
-            # print('prop idx', proposal_idx)
-            proposed_ll, proposed_logR, proposed_config, proposed_heights, proposed_knots = tmp
-            if prior_test:
-                proposed_ll = 0
-
-            # need to handle ratio of probabilities of birth vs. death proposals
-            # because prob(n -> n+1) would be different from prob(n+1 -> n)
-            # if ratio with which we make proposals is different.
-            # this is subtle...usually the ratio of *which* proposals you choose
-            # doesn't matter
-            if self.available_proposals[proposal_idx] == 'birth':
-                q = -np.log(birth_to_death_ratio)
-            elif self.available_proposals[proposal_idx] == 'death':
-                q = np.log(birth_to_death_ratio)
-            else:
-                q = 0
-
-            hastings_ratio = min(np.log(1), (proposed_ll - current_ll) * 1/temperature + proposed_logR + q)
-            compare_val = np.log(np.random.rand())
-
-            # print('heights', proposed_heights, self.current_heights)
-            # print('ll', proposed_ll, current_ll)
-            if compare_val < hastings_ratio:
-                self.configuration = proposed_config
-                self.current_heights = proposed_heights
-                self.available_knots = proposed_knots
-                current_ll = proposed_ll
-                acc = True
-            else:
-                acc = False
-
-            configurations[ii] = self.configuration
-            heights[ii] = self.current_heights
-            knots[ii] = self.available_knots
-            acceptances[ii] = acc
-            move_types[ii] = proposal_idx
-            lls[ii] = current_ll
-
-        return SamplerResults(acceptances, configurations, heights, knots, lls, move_types)
+                # Accept/reject
+                if np.log(np.random.rand()) < log_alpha:
+                    configurations[i] = proposal.new_config
+                    heights[i] = proposal.new_heights
+                    knots[i] = proposal.new_knots
+                    log_likelihoods[i] = proposal.log_likelihood
+                    
+                    # Update current state
+                    self.state = SplineState(
+                        configuration=proposal.new_config,
+                        heights=proposal.new_heights,
+                        knots=proposal.new_knots,
+                        log_likelihood=proposal.log_likelihood
+                    )
+                    n_accepted += 1
+                    acceptances[i] = True
+                else:
+                    configurations[i] = configurations[i-1]
+                    heights[i] = heights[i-1]
+                    knots[i] = knots[i-1]
+                    log_likelihoods[i] = log_likelihoods[i-1]
+                
+                # Update progress bar
+                pbar.set_postfix(acceptance_rate=n_accepted/(i+1))
+                pbar.update(1)
+                
+        if self.log_output:
+            print(f"Acceptance rate: {n_accepted/(Niterations-1):.3f}")
+            
+        return SamplerResults(
+            log_likelihoods=log_likelihoods,
+            configurations=configurations,
+            heights=heights,
+            knots=knots,
+            acceptance_rate=n_accepted/(Niterations-1),
+            proposals_used=proposals_used,
+            acceptances=acceptances,
+            log_ratios=log_ratios
+        )
 
 
-class SamplerResults(object):
-    def __init__(self, acceptances, configurations, heights, knots, lls, move_types):
-        self.acceptances = acceptances
+class SamplerResults:
+    def __init__(self, log_likelihoods, configurations, heights, knots, acceptance_rate, proposals_used, acceptances, log_ratios):
+        self.log_likelihoods = log_likelihoods
         self.configurations = configurations
         self.heights = heights
-        self.lls = lls
-        self.move_types = move_types
         self.knots = knots
+        self.acceptance_rate = acceptance_rate
+        self.proposals_used = proposals_used
+        self.acceptances = acceptances
+        self.log_ratios = log_ratios
 
     def get_num_knots(self):
         return np.sum(self.configurations, axis=1)
@@ -448,6 +486,20 @@ class SamplerResults(object):
             else:
                 temp.append(self.knots[:, ii])
         return temp
+
+    def print_acceptance_rates_by_proposal(self):
+        from collections import Counter
+        total_counts = Counter(self.proposals_used)
+        accepted_counts = Counter()
+        
+        for i, proposal in enumerate(self.proposals_used):
+            if self.acceptances[i]:
+                accepted_counts[proposal] += 1
+        
+        print(accepted_counts)
+        for proposal, count in total_counts.items():
+            rate = accepted_counts[proposal] / count if count else 0
+            print(f"{proposal}: {rate:.3f} {accepted_counts[proposal]}")
 
 class SmoothCurveDataObj(object):
     """
