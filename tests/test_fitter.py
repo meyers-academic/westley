@@ -44,10 +44,10 @@ class TestFitter:
 
 
     def test_prior_run_full_proposal(self):
-        results = self.bsm.sample(Niterations=200000, prior_test=True)
+        # self.bsm.set_proposal_cycle({'birth': 0.5, 'death': 0.5})  # Set proposal cycle explicitly
+        results = self.bsm.run(Niterations=200000, prior_test=True)
 
-        # thin by factor of 100 because
-        # of possible correlations between samples
+        # Thin by factor of 100 because of possible correlations between samples
         num_knots = results.get_num_knots()[::100]
         results.print_acceptance_rates_by_proposal()
         p_value = check_uniform_distribution(num_knots, discrete=True)
@@ -66,20 +66,19 @@ class TestFitter:
 
     def test_prior_run_amplitude_prior_proposal(self):
         bsm = fitter.FitSmoothCurveModel(self.fake_data,
-                                    self.max_knots,
-                                    (0, 5),
-                                    (-2, 2),
-                                    interp_type='linear',
-                                    log_output=False,
-                                    log_space_xvals=False,
-                                    birth_uniform_frac=0.5,
-                                    min_knots=2,
-                                    birth_gauss_scalefac=1
-                                        )
-        results = bsm.sample(Niterations=200000, prior_test=True, proposal_cycle={'change_amplitude_prior_draw': 1})
-        # thin by factor of 100 because
+                                         self.max_knots,
+                                         (0, 5),
+                                         (-2, 2),
+                                         interp_type='linear',
+                                         log_output=False,
+                                         log_space_xvals=False,
+                                         birth_uniform_frac=0.5,
+                                         min_knots=2,
+                                         birth_gauss_scalefac=1)
+        bsm.set_proposal_cycle({'change_amplitude_prior_draw': 1})  # Set proposal cycle explicitly
+        results = bsm.run(Niterations=200000, prior_test=True)
 
-        # of possible correlations between samples
+        # Thin by factor of 100 because of possible correlations between samples
         p_value = check_uniform_distribution(results.heights[::100, 0], range=(self.bsm.ylow, self.bsm.yhigh - self.bsm.ylow))
         plt.hist(results.heights[::100, 0])
         plt.savefig("height_samples.png")
@@ -147,6 +146,7 @@ class TestFitter:
             diff = proposal.new_heights != original_heights
             assert np.sum(diff) == 1, "Only one height should change"
             # Changed height should be within bounds
+            print('hi', proposal.log_ratio)
             assert np.all(proposal.new_heights >= self.bsm.ylow)
             assert np.all(proposal.new_heights <= self.bsm.yhigh)
 
@@ -210,10 +210,11 @@ class TestFitter:
         print('birthweight', birthweight)
         print('fraction of birth proposals from uniform dist', self.bsm.birth_uniform_frac)
 
-        # set proposal cycle
+        # Set proposal cycle
         proposal_cycle = {'birth': birthweight, 'death': 1 - birthweight}
+        self.bsm.set_proposal_cycle(proposal_cycle)
 
-        results = self.bsm.sample(Niterations=num_samples, proposal_cycle=proposal_cycle, prior_test=True)
+        results = self.bsm.run(Niterations=num_samples, prior_test=True)
         num_knots = results.get_num_knots()[::50]
         bins, counts = np.unique(num_knots, return_counts=True)
         results.print_acceptance_rates_by_proposal()
