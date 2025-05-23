@@ -279,7 +279,7 @@ class BaseSplineModel:
     @proposal(name='death', weight=1)
     def death(self):
         """Death proposal: Remove an existing knot."""
-        active_idx = np.where(self.state.configuration[1:-1])[0] + 1
+        active_idx = np.where(self.state.configuration)[0]
         if len(active_idx) <= self.min_knots:
             return None
 
@@ -302,6 +302,8 @@ class BaseSplineModel:
     @proposal(name='change_amplitude_prior_draw', weight=1)
     def change_amplitude_prior_draw(self):
         """Change amplitude by drawing from the prior."""
+        if self.state.configuration.sum() == 0:
+            return None
         active_idx = np.where(self.state.configuration)[0]
         idx_to_change = random.choices(active_idx, k=1)[0]
 
@@ -324,6 +326,8 @@ class BaseSplineModel:
     @proposal(name='change_amplitude_gaussian', weight=1)
     def change_amplitude_gaussian(self):
         """Change amplitude using a Gaussian proposal."""
+        if self.state.configuration.sum() == 0:
+            return None
         active_idx = np.where(self.state.configuration)[0]
         idx_to_change = random.choices(active_idx, k=1)[0]
 
@@ -345,6 +349,8 @@ class BaseSplineModel:
     @proposal(name='change_knot_location', weight=1)
     def change_knot_location(self):
         """Change the location of an existing knot."""
+        if self.state.configuration.sum() == 0:
+            return None
         active_idx = np.where(self.state.configuration)[0]
         idx_to_change = random.choices(active_idx, k=1)[0]
         
@@ -364,14 +370,14 @@ class BaseSplineModel:
     def evaluate_interp_model(self, x, heights, configuration, knots):
         active_knots = knots[configuration]
         active_heights = heights[configuration]
-        
+
         if len(active_knots) < 2:
             return active_heights[0]
-            
+
         sorted_indices = np.argsort(active_knots)
         x_sorted = active_knots[sorted_indices]
         y_sorted = active_heights[sorted_indices]
-        
+
         if self.interp_type == "linear":
             interpolator = interp1d(x_sorted, y_sorted, bounds_error=False, 
                                   fill_value='extrapolate')# (y_sorted[0], y_sorted[-1]))
@@ -379,7 +385,7 @@ class BaseSplineModel:
             interpolator = Akima1DInterpolator(x_sorted, y_sorted)
         else:
             raise ValueError(f"Unknown interpolation type: {self.interp_type}")
-            
+
         return interpolator(x)
 
     def step(self, prior_test=False) -> SamplerState:
